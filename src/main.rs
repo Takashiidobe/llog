@@ -1,9 +1,11 @@
 mod index;
 mod wiki;
 
+use std::io::IsTerminal;
 use std::process::Command as Process;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -17,12 +19,37 @@ struct Cli {
 enum Command {
     Init,
     New { title: String },
-    Log { title: String, entry: String },
+    Log {
+        title: String,
+        entry: String,
+        #[arg(long)]
+        date: Option<String>,
+    },
     Search {
         query: String,
         #[arg(short, long, default_value_t = 3)]
         limit: usize,
+        #[arg(long)]
+        plain: bool,
     },
+    Review {
+        #[arg(long)]
+        mark: Option<String>,
+    },
+}
+
+fn parse_date(s: &str) -> Result<DateTime<Local>> {
+    let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M"))
+        .or_else(|_| NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(0, 0, 0).unwrap()))
+        .with_context(|| {
+            format!("could not parse \"{s}\" as a date; expected YYYY-MM-DD, YYYY-MM-DD HH:MM, or YYYY-MM-DD HH:MM:SS")
+        })?;
+
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .with_context(|| format!("\"{s}\" is ambiguous or invalid in the local timezone"))
 }
 
 fn vim_search_pattern(query: &str) -> String {
@@ -55,11 +82,12 @@ fn main() -> Result<()> {
             let path = wiki::new_concept(&title)?;
             println!("created {}", path.display());
         }
-        Command::Log { title, entry } => {
-            let path = wiki::append_log(&title, &entry)?;
+        Command::Log { title, entry, date } => {
+            let when = date.as_deref().map(parse_date).transpose()?.unwrap_or_else(Local::now);
+            let path = wiki::append_log(&title, &entry, when)?;
             println!("created {}", path.display());
         }
-        Command::Search { query, limit } => {
+        Command::Search { query, limit, plain } => {
             let hits = index::search(&query, limit)?;
             if hits.is_empty() {
                 println!("no results");
@@ -69,6 +97,10 @@ fn main() -> Result<()> {
             let paths: Vec<_> = hits.iter().map(|hit| wiki::wiki_root().join(&hit.path)).collect();
             for path in &paths {
                 println!("{}", path.display());
+            }
+
+            if plain || !std::io::stdout().is_terminal() {
+                return Ok(());
             }
 
             let pattern = vim_search_pattern(&query);
@@ -85,6 +117,22 @@ fn main() -> Result<()> {
                 .status()?;
             if !status.success() {
                 anyhow::bail!("nvim exited with {status}");
+            }
+        }
+        Command::Review { mark } => {
+            if let Some(mark) = mark {
+                wiki::mark_reviewed(std::path::Path::new(&mark))?;
+                println!("marked reviewed through {mark}");
+                return Ok(());
+            }
+
+            let pending = wiki::pending_log_entries()?;
+            if pending.is_empty() {
+                println!("no unreviewed log entries");
+                return Ok(());
+            }
+            for path in pending {
+                println!("{}", path.display());
             }
         }
     }

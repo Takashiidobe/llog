@@ -2,12 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{DateTime, Local};
 
 pub const WIKI_DIR: &str = "wiki";
 pub const CONCEPTS_DIR: &str = "concepts";
 pub const INDEX_FILE: &str = "index.md";
 pub const LOG_DIR: &str = "log";
+pub const REVIEWED_MARKER: &str = ".reviewed";
 
 pub fn wiki_root() -> PathBuf {
     PathBuf::from(WIKI_DIR)
@@ -90,21 +91,58 @@ fn link_from_index(title: &str, concept_path: &Path) -> Result<()> {
     fs::write(&index_path, contents).with_context(|| format!("writing {}", index_path.display()))
 }
 
-pub fn append_log(title: &str, entry: &str) -> Result<PathBuf> {
+pub fn append_log(title: &str, entry: &str, when: DateTime<Local>) -> Result<PathBuf> {
     let log_dir = wiki_root().join(LOG_DIR);
     fs::create_dir_all(&log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
 
-    let now = Local::now();
-    let stamp = now.format("%Y-%m-%d-%H-%M");
+    let stamp = when.format("%Y-%m-%d-%H-%M");
     let mut path = log_dir.join(format!("{stamp}.md"));
     let mut suffix = 1;
     while path.exists() {
-        path = log_dir.join(format!("{stamp}-{suffix}.md"));
+        path = log_dir.join(format!("{stamp}_{suffix}.md"));
         suffix += 1;
     }
 
-    let contents = format!("# {title}\n\n_{}_\n\n{entry}\n", now.format("%Y-%m-%d %H:%M:%S"));
+    let contents = format!("# {title}\n\n_{}_\n\n{entry}\n", when.format("%Y-%m-%d %H:%M:%S"));
     fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
 
     Ok(path)
+}
+
+pub fn pending_log_entries() -> Result<Vec<PathBuf>> {
+    let log_dir = wiki_root().join(LOG_DIR);
+    if !log_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let marker_path = wiki_root().join(REVIEWED_MARKER);
+    let marker = if marker_path.exists() {
+        fs::read_to_string(&marker_path)
+            .with_context(|| format!("reading {}", marker_path.display()))?
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let mut entries: Vec<String> = fs::read_dir(&log_dir)
+        .with_context(|| format!("reading {}", log_dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| name.as_str() > marker.as_str())
+        .collect();
+    entries.sort();
+
+    Ok(entries.into_iter().map(|name| log_dir.join(name)).collect())
+}
+
+pub fn mark_reviewed(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{} has no file name", path.display()))?;
+
+    fs::write(wiki_root().join(REVIEWED_MARKER), file_name)
+        .with_context(|| format!("writing {}", wiki_root().join(REVIEWED_MARKER).display()))
 }
