@@ -1,3 +1,4 @@
+mod check;
 mod index;
 mod wiki;
 
@@ -36,6 +37,7 @@ enum Command {
         #[arg(long)]
         mark: Option<String>,
     },
+    Check,
 }
 
 fn parse_date(s: &str) -> Result<DateTime<Local>> {
@@ -134,6 +136,17 @@ fn main() -> Result<()> {
             for path in pending {
                 println!("{}", path.display());
             }
+        }
+        Command::Check => {
+            let dangling = check::find_dangling_links()?;
+            if dangling.is_empty() {
+                println!("no dangling links");
+                return Ok(());
+            }
+            for link in &dangling {
+                println!("{}: {}", link.file.display(), link.target);
+            }
+            anyhow::bail!("{} dangling link(s) found", dangling.len());
         }
     }
 
