@@ -19,12 +19,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init,
-    New { title: String },
-    Log {
+    New {
         title: String,
         entry: String,
         #[arg(long)]
         date: Option<String>,
+    },
+    Wiki {
+        title: String,
     },
     Search {
         query: String,
@@ -80,23 +82,34 @@ fn main() -> Result<()> {
             index::build()?;
             println!("initialized {}", path.display());
         }
-        Command::New { title } => {
-            let path = wiki::new_concept(&title)?;
-            println!("created {}", path.display());
-        }
-        Command::Log { title, entry, date } => {
-            let when = date.as_deref().map(parse_date).transpose()?.unwrap_or_else(Local::now);
+        Command::New { title, entry, date } => {
+            let when = date
+                .as_deref()
+                .map(parse_date)
+                .transpose()?
+                .unwrap_or_else(Local::now);
             let path = wiki::append_log(&title, &entry, when)?;
             println!("created {}", path.display());
         }
-        Command::Search { query, limit, plain } => {
+        Command::Wiki { title } => {
+            let path = wiki::new_concept(&title)?;
+            println!("created {}", path.display());
+        }
+        Command::Search {
+            query,
+            limit,
+            plain,
+        } => {
             let hits = index::search(&query, limit)?;
             if hits.is_empty() {
                 println!("no results");
                 return Ok(());
             }
 
-            let paths: Vec<_> = hits.iter().map(|hit| wiki::wiki_root().join(&hit.path)).collect();
+            let paths: Vec<_> = hits
+                .iter()
+                .map(|hit| wiki::wiki_root().join(&hit.path))
+                .collect();
             for path in &paths {
                 println!("{}", path.display());
             }
@@ -151,4 +164,47 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn new_parses_as_a_log_command() {
+        let cli = Cli::try_parse_from([
+            "llog",
+            "new",
+            "standup",
+            "finished the parser change",
+            "--date",
+            "2026-08-29",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::New { title, entry, date } => {
+                assert_eq!(title, "standup");
+                assert_eq!(entry, "finished the parser change");
+                assert_eq!(date.as_deref(), Some("2026-08-29"));
+            }
+            _ => panic!("new should create a log"),
+        }
+    }
+
+    #[test]
+    fn wiki_parses_as_a_concept_command() {
+        let cli = Cli::try_parse_from(["llog", "wiki", "Rust ownership"]).unwrap();
+
+        match cli.command {
+            Command::Wiki { title } => assert_eq!(title, "Rust ownership"),
+            _ => panic!("wiki should create a concept"),
+        }
+    }
+
+    #[test]
+    fn log_is_not_a_command() {
+        assert!(Cli::try_parse_from(["llog", "log", "title", "entry"]).is_err());
+    }
 }
