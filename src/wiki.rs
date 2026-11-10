@@ -10,6 +10,70 @@ pub const INDEX_FILE: &str = "index.md";
 pub const LOG_DIR: &str = "log";
 pub const REVIEWED_MARKER: &str = ".reviewed";
 
+pub type Meta = Vec<(String, String)>;
+
+pub fn parse_meta(keys: &[String], values: &[String]) -> Result<Meta> {
+    if keys.len() != values.len() {
+        anyhow::bail!(
+            "-k/--key and -v/--value must be paired: got {} key(s) and {} value(s)",
+            keys.len(),
+            values.len()
+        );
+    }
+    keys.iter()
+        .zip(values)
+        .map(|(key, value)| {
+            let key = key.trim().to_lowercase();
+            if !valid_key(&key) {
+                anyhow::bail!("invalid key \"{key}\"; use letters, digits, '-' and '_'");
+            }
+            let value = value.trim().to_string();
+            if value.is_empty() || value.contains('\n') {
+                anyhow::bail!("value for \"{key}\" must be a non-empty single line");
+            }
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn valid_key(key: &str) -> bool {
+    key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn format_meta(meta: &Meta) -> String {
+    if meta.is_empty() {
+        return String::new();
+    }
+    let mut block: String = meta.iter().map(|(k, v)| format!("- {k}: {v}\n")).collect();
+    block.push('\n');
+    block
+}
+
+pub fn read_meta(contents: &str) -> Meta {
+    let mut lines = contents.lines().skip(1).peekable();
+    while let Some(line) = lines.peek() {
+        if line.trim().is_empty() {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    match lines.next() {
+        Some(line) if line.starts_with('_') && line.ends_with('_') => {}
+        _ => return Vec::new(),
+    }
+    while lines.peek().is_some_and(|l| l.trim().is_empty()) {
+        lines.next();
+    }
+    lines
+        .map_while(|line| {
+            let (key, value) = line.strip_prefix("- ")?.split_once(": ")?;
+            valid_key(key).then(|| (key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 pub fn wiki_root() -> PathBuf {
     PathBuf::from(WIKI_DIR)
 }
@@ -50,7 +114,7 @@ pub fn init() -> Result<PathBuf> {
     Ok(root)
 }
 
-pub fn new_concept(title: &str, entry: &str) -> Result<PathBuf> {
+pub fn new_concept(title: &str, entry: &str, meta: &Meta) -> Result<PathBuf> {
     let concepts_dir = wiki_root().join(CONCEPTS_DIR);
     fs::create_dir_all(&concepts_dir)
         .with_context(|| format!("creating {}", concepts_dir.display()))?;
@@ -65,7 +129,7 @@ pub fn new_concept(title: &str, entry: &str) -> Result<PathBuf> {
     }
 
     let date = Local::now().format("%Y-%m-%d");
-    fs::write(&path, format!("# {title}\n\n_created {date}_\n\n{entry}"))
+    fs::write(&path, format!("# {title}\n\n_created {date}_\n\n{}{entry}", format_meta(meta)))
         .with_context(|| format!("writing {}", path.display()))?;
 
     link_from_index(title, &path)?;
@@ -91,7 +155,7 @@ fn link_from_index(title: &str, concept_path: &Path) -> Result<()> {
     fs::write(&index_path, contents).with_context(|| format!("writing {}", index_path.display()))
 }
 
-pub fn append_log(title: &str, entry: &str, when: DateTime<Local>) -> Result<PathBuf> {
+pub fn append_log(title: &str, entry: &str, meta: &Meta, when: DateTime<Local>) -> Result<PathBuf> {
     let log_dir = wiki_root().join(LOG_DIR);
     fs::create_dir_all(&log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
 
@@ -104,8 +168,9 @@ pub fn append_log(title: &str, entry: &str, when: DateTime<Local>) -> Result<Pat
     }
 
     let contents = format!(
-        "# {title}\n\n_{}_\n\n{entry}\n",
-        when.format("%Y-%m-%d %H:%M:%S")
+        "# {title}\n\n_{}_\n\n{}{entry}\n",
+        when.format("%Y-%m-%d %H:%M:%S"),
+        format_meta(meta)
     );
     fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
 

@@ -7,16 +7,24 @@ use anyhow::{Context, Result};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, FAST, STORED, STRING, TEXT};
-use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser};
+use tantivy::schema::{
+    Field, IndexRecordOption, JsonObjectOptions, Schema, TextFieldIndexing, Value, FAST, STORED,
+    STRING, TEXT,
+};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
-use crate::wiki::{wiki_root, INDEX_FILE, LOG_DIR};
+use crate::wiki::{read_meta, wiki_root, Meta, CONCEPTS_DIR, INDEX_FILE, LOG_DIR};
 
 const TITLE_BOOST: f32 = 3.0;
+const META_BOOST: f32 = 2.5;
 const LOG_HALF_LIFE_DAYS: f64 = 90.0;
-const CANDIDATE_POOL: usize = 50;
+const CONCEPT_WEIGHT: f32 = 4.0;
+const HISTORICAL_WEIGHT: f32 = 0.15;
+const CANDIDATE_POOL: usize = 200;
+const SCHEMA_VERSION: u32 = 3;
+const HISTORICAL_DIR: &str = "historical";
 
 const STATE_DIR: &str = ".llog";
 const INDEX_DIR: &str = "index";
@@ -24,6 +32,8 @@ const STATE_FILE: &str = "state.json";
 
 #[derive(Serialize, Deserialize, Default)]
 struct State {
+    #[serde(default)]
+    version: u32,
     files: HashMap<String, u64>,
 }
 
@@ -53,6 +63,7 @@ fn save_state(state: &State) -> Result<()> {
 struct Fields {
     path: Field,
     title: Field,
+    meta: Field,
     body: Field,
     mtime: Field,
 }
@@ -61,9 +72,18 @@ fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let path = builder.add_text_field("path", STRING | STORED | FAST);
     let title = builder.add_text_field("title", TEXT | STORED);
+    let meta = builder.add_text_field("meta", TEXT);
+    builder.add_json_field(
+        "meta_json",
+        JsonObjectOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        ),
+    );
     let body = builder.add_text_field("body", TEXT | STORED);
     let mtime = builder.add_u64_field("mtime", FAST | STORED);
-    (builder.build(), Fields { path, title, body, mtime })
+    (builder.build(), Fields { path, title, meta, body, mtime })
 }
 
 fn mtime_secs(path: &Path) -> Result<u64> {
@@ -80,9 +100,35 @@ fn title_of(contents: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn meta_json_value(meta: &Meta) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in meta {
+        let value = serde_json::Value::String(value.to_lowercase());
+        match map.get_mut(key) {
+            Some(serde_json::Value::Array(items)) => items.push(value),
+            Some(existing) => {
+                let first = existing.take();
+                *existing = serde_json::Value::Array(vec![first, value]);
+            }
+            None => {
+                map.insert(key.clone(), value);
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 fn open_index_synced() -> Result<(Index, Fields)> {
     fs::create_dir_all(index_path())?;
     let (schema, fields) = build_schema();
+
+    let mut state = load_state()?;
+    if state.version != SCHEMA_VERSION {
+        let _ = fs::remove_dir_all(index_path());
+        fs::create_dir_all(index_path())?;
+        state = State { version: SCHEMA_VERSION, ..State::default() };
+        save_state(&state)?;
+    }
 
     let index = if index_path().join("meta.json").exists() {
         Index::open_in_dir(index_path())?
@@ -90,7 +136,6 @@ fn open_index_synced() -> Result<(Index, Fields)> {
         Index::create_in_dir(index_path(), schema.clone())?
     };
 
-    let mut state = load_state()?;
     let mut writer: IndexWriter = index.writer(50_000_000)?;
     let mut changed = false;
 
@@ -122,12 +167,17 @@ fn open_index_synced() -> Result<(Index, Fields)> {
             let title = title_of(&contents, &rel);
 
             writer.delete_term(Term::from_field_text(fields.path, &rel));
-            writer.add_document(doc!(
-                fields.path => rel.clone(),
-                fields.title => title,
-                fields.body => contents,
-                fields.mtime => mtime,
-            ))?;
+            let meta = read_meta(&contents);
+            let flat_meta: Vec<String> = meta.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            let document = serde_json::json!({
+                "path": rel,
+                "title": title,
+                "meta": flat_meta.join("\n"),
+                "meta_json": meta_json_value(&meta),
+                "body": contents,
+                "mtime": mtime,
+            });
+            writer.add_document(TantivyDocument::parse_json(&schema, &document.to_string())?)?;
             changed = true;
         }
     }
@@ -178,14 +228,25 @@ fn log_decay(mtime: u64, now: u64) -> f32 {
     0.5f64.powf(age_days / LOG_HALF_LIFE_DAYS) as f32
 }
 
-pub fn search(query_str: &str, limit: usize) -> Result<Vec<Hit>> {
+pub fn search(query_str: &str, limit: usize, filters: &Meta) -> Result<Vec<Hit>> {
     let (index, fields) = open_index_synced()?;
     let reader: IndexReader = index.reader()?;
     let searcher = reader.searcher();
 
-    let mut parser = QueryParser::for_index(&index, vec![fields.title, fields.body]);
+    let mut parser = QueryParser::for_index(&index, vec![fields.title, fields.meta, fields.body]);
     parser.set_field_boost(fields.title, TITLE_BOOST);
-    let query = parser.parse_query(query_str)?;
+    parser.set_field_boost(fields.meta, META_BOOST);
+    let text_query: Box<dyn Query> = if query_str.trim().is_empty() {
+        Box::new(AllQuery)
+    } else {
+        parser.parse_query(query_str)?
+    };
+    let mut clauses = vec![(Occur::Must, text_query)];
+    for (key, value) in filters {
+        let escaped = value.to_lowercase().replace('\\', "\\\\").replace('"', "\\\"");
+        clauses.push((Occur::Must, parser.parse_query(&format!("meta_json.{key}:\"{escaped}\""))?));
+    }
+    let query = BooleanQuery::new(clauses);
 
     let candidate_limit = limit.max(CANDIDATE_POOL);
     let top_docs = searcher.search(&query, &TopDocs::with_limit(candidate_limit))?;
@@ -204,6 +265,10 @@ pub fn search(query_str: &str, limit: usize) -> Result<Vec<Hit>> {
                 .or_else(|| doc.get_first(fields.mtime).and_then(|v| v.as_u64()))
                 .unwrap_or(now);
             score * log_decay(mtime, now)
+        } else if path.starts_with(&format!("{HISTORICAL_DIR}/")) {
+            score * HISTORICAL_WEIGHT
+        } else if path.starts_with(&format!("{CONCEPTS_DIR}/")) {
+            score * CONCEPT_WEIGHT
         } else {
             score
         };

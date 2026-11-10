@@ -25,18 +25,31 @@ enum Command {
         entry: String,
         #[arg(long)]
         date: Option<String>,
+        #[arg(short = 'k', long = "key", help = "Metadata key; pair each with a -v")]
+        keys: Vec<String>,
+        #[arg(short = 'v', long = "value", help = "Metadata value for the matching -k")]
+        values: Vec<String>,
     },
     Wiki {
         title: String,
         #[arg(help = "Passed as string (\"entry\"), @FILE to read from a file, or @- for stdin")]
         entry: Option<String>,
+        #[arg(short = 'k', long = "key", help = "Metadata key; pair each with a -v")]
+        keys: Vec<String>,
+        #[arg(short = 'v', long = "value", help = "Metadata value for the matching -k")]
+        values: Vec<String>,
     },
     Search {
+        #[arg(help = "Query text; may be empty when filtering with -k/-v")]
         query: String,
         #[arg(short, long, default_value_t = 3)]
         limit: usize,
         #[arg(long)]
         plain: bool,
+        #[arg(short = 'k', long = "key", help = "Only entries whose metadata has this key; pair each with a -v")]
+        keys: Vec<String>,
+        #[arg(short = 'v', long = "value", help = "Value the matching -k must equal")]
+        values: Vec<String>,
     },
     Review {
         #[arg(long)]
@@ -100,27 +113,32 @@ fn main() -> Result<()> {
             index::build()?;
             println!("initialized {}", path.display());
         }
-        Command::New { title, entry, date } => {
+        Command::New { title, entry, date, keys, values } => {
+            let meta = wiki::parse_meta(&keys, &values)?;
             let entry = read_entry(Some(entry))?;
             let when = date
                 .as_deref()
                 .map(parse_date)
                 .transpose()?
                 .unwrap_or_else(Local::now);
-            let path = wiki::append_log(&title, &entry, when)?;
+            let path = wiki::append_log(&title, &entry, &meta, when)?;
             println!("created {}", path.display());
         }
-        Command::Wiki { title, entry } => {
+        Command::Wiki { title, entry, keys, values } => {
+            let meta = wiki::parse_meta(&keys, &values)?;
             let entry = read_entry(entry)?;
-            let path = wiki::new_concept(&title, &entry)?;
+            let path = wiki::new_concept(&title, &entry, &meta)?;
             println!("created {}", path.display());
         }
         Command::Search {
             query,
             limit,
             plain,
+            keys,
+            values,
         } => {
-            let hits = index::search(&query, limit)?;
+            let filters = wiki::parse_meta(&keys, &values)?;
+            let hits = index::search(&query, limit, &filters)?;
             if hits.is_empty() {
                 println!("no results");
                 return Ok(());
@@ -204,7 +222,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Command::New { title, entry, date } => {
+            Command::New { title, entry, date, .. } => {
                 assert_eq!(title, "standup");
                 assert_eq!(entry, "finished the parser change");
                 assert_eq!(date.as_deref(), Some("2026-08-29"));
@@ -218,7 +236,7 @@ mod tests {
         let cli = Cli::try_parse_from(["llog", "wiki", "Rust ownership"]).unwrap();
 
         match cli.command {
-            Command::Wiki { title, entry } => {
+            Command::Wiki { title, entry, .. } => {
                 assert_eq!(title, "Rust ownership");
                 assert!(entry.is_none());
             }
