@@ -50,7 +50,7 @@ pub fn init() -> Result<PathBuf> {
     Ok(root)
 }
 
-pub fn new_concept(title: &str) -> Result<PathBuf> {
+pub fn new_concept(title: &str, entry: &str) -> Result<PathBuf> {
     let concepts_dir = wiki_root().join(CONCEPTS_DIR);
     fs::create_dir_all(&concepts_dir)
         .with_context(|| format!("creating {}", concepts_dir.display()))?;
@@ -65,7 +65,7 @@ pub fn new_concept(title: &str) -> Result<PathBuf> {
     }
 
     let date = Local::now().format("%Y-%m-%d");
-    fs::write(&path, format!("# {title}\n\n_created {date}_\n\n"))
+    fs::write(&path, format!("# {title}\n\n_created {date}_\n\n{entry}"))
         .with_context(|| format!("writing {}", path.display()))?;
 
     link_from_index(title, &path)?;
@@ -103,7 +103,10 @@ pub fn append_log(title: &str, entry: &str, when: DateTime<Local>) -> Result<Pat
         suffix += 1;
     }
 
-    let contents = format!("# {title}\n\n_{}_\n\n{entry}\n", when.format("%Y-%m-%d %H:%M:%S"));
+    let contents = format!(
+        "# {title}\n\n_{}_\n\n{entry}\n",
+        when.format("%Y-%m-%d %H:%M:%S")
+    );
     fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
 
     Ok(path)

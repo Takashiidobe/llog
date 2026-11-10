@@ -2,7 +2,7 @@ mod check;
 mod index;
 mod wiki;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::process::Command as Process;
 
 use anyhow::{Context, Result};
@@ -21,12 +21,15 @@ enum Command {
     Init,
     New {
         title: String,
+        #[arg(help = "Passed as string (\"entry\"), @FILE to use a file, or @- for stdin")]
         entry: String,
         #[arg(long)]
         date: Option<String>,
     },
     Wiki {
         title: String,
+        #[arg(help = "Passed as string (\"entry\"), @FILE to read from a file, or @- for stdin")]
+        entry: Option<String>,
     },
     Search {
         query: String,
@@ -73,6 +76,21 @@ fn vim_search_pattern(query: &str) -> String {
     format!(r"\c\({}\)", terms.join(r"\|"))
 }
 
+fn read_entry(entry: Option<String>) -> Result<String> {
+    let Some(entry) = entry else {
+        return Ok(String::new());
+    };
+    let Some(source) = entry.strip_prefix('@') else {
+        return Ok(entry);
+    };
+    if source == "-" {
+        let mut contents = String::new();
+        std::io::stdin().read_to_string(&mut contents)?;
+        return Ok(contents);
+    }
+    std::fs::read_to_string(source).with_context(|| format!("reading entry from {source}"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -83,6 +101,7 @@ fn main() -> Result<()> {
             println!("initialized {}", path.display());
         }
         Command::New { title, entry, date } => {
+            let entry = read_entry(Some(entry))?;
             let when = date
                 .as_deref()
                 .map(parse_date)
@@ -91,8 +110,9 @@ fn main() -> Result<()> {
             let path = wiki::append_log(&title, &entry, when)?;
             println!("created {}", path.display());
         }
-        Command::Wiki { title } => {
-            let path = wiki::new_concept(&title)?;
+        Command::Wiki { title, entry } => {
+            let entry = read_entry(entry)?;
+            let path = wiki::new_concept(&title, &entry)?;
             println!("created {}", path.display());
         }
         Command::Search {
@@ -198,7 +218,10 @@ mod tests {
         let cli = Cli::try_parse_from(["llog", "wiki", "Rust ownership"]).unwrap();
 
         match cli.command {
-            Command::Wiki { title } => assert_eq!(title, "Rust ownership"),
+            Command::Wiki { title, entry } => {
+                assert_eq!(title, "Rust ownership");
+                assert!(entry.is_none());
+            }
             _ => panic!("wiki should create a concept"),
         }
     }
